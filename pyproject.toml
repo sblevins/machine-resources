@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "machine-resources"
+version = "0.1.0"
+description = "Cooperative memory and CPU reservations for shared machines"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+dependencies = ["psutil>=6,<8", "portalocker>=3,<4"]
+
+[project.urls]
+Repository = "https://github.com/sblevins/machine-resources"
+
+[project.scripts]
+machine-resources = "machine_resources:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["machine_resources"]
