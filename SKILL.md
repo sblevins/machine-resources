@@ -1,12 +1,13 @@
 ---
 name: machine-resources
-description: Coordinate memory and CPU reservations before running heavy builds, test suites, fuzzers, benchmarks, browsers, dev servers, local chains, or models on a shared Linux machine. Use before heavy work or when investigating resource contention.
+description: Coordinate memory and CPU reservations before running heavy builds, test suites, fuzzers, benchmarks, browsers, dev servers, local chains, or models on a shared Linux, macOS, or Windows machine. Use before heavy work or when investigating resource contention.
 ---
 
 # Machine resources
 
 Use the `machine-resources` CLI to reserve resources before heavy work.
-If it is not on PATH, use `scripts/machine-resources` resolved relative to this skill directory.
+If it is not on PATH, invoke `scripts/machine-resources` relative to this skill directory with a Python interpreter that has the package dependencies installed.
+On Windows, use the installed `machine-resources.exe` or invoke the source launcher with Python; do not depend on Unix shebang execution.
 Read `README.md` in this directory for installation, platform requirements, accounting limitations, and privacy details.
 
 ## Workflow
@@ -39,7 +40,10 @@ Use it only when current availability and outstanding reservations indicate that
 Check status immediately before deciding and record why that risk is realistic.
 When uncertain, reserve a conservative higher estimate rather than automatically adding a hard limit.
 
-`--hard-limit` enforces the reserved memory through a systemd cgroup and disables swap for that job.
+`--hard-limit` is Linux-only and is rejected on macOS and Windows before launching work.
+On those systems, wait for capacity or reduce the workload if proceeding without a hard limit would risk exhausting memory.
+
+On Linux, `--hard-limit` enforces the reserved memory through a systemd cgroup and disables swap for that job.
 Plain version: this can kill the job at its allowance even while memory is still available elsewhere.
 Only impose that cutoff when extra usage could make the whole machine run out and cause Linux to kill another process.
 
