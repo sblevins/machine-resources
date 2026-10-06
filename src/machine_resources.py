@@ -318,6 +318,8 @@ def append_history(claim, outcome, note=None, exit_code=None, peak_memory_bytes=
     """Record a finished reservation so later agents can calibrate their estimates. Caller holds the lock."""
     entry = {
         "finished_at": now_iso(),
+        "claim_id": claim["id"],
+        "claim_started_at": claim["started_at"],
         "outcome": outcome,
         "description": claim["description"],
         "command": claim["command"],
@@ -334,6 +336,16 @@ def append_history(claim, outcome, note=None, exit_code=None, peak_memory_bytes=
     if os.path.exists(HISTORY_PATH):
         with open(HISTORY_PATH) as history_file:
             lines = history_file.readlines()
+    if outcome == "finished":
+        # Another registry caller may sweep the exited child before its wrapper
+        # acquires the lock. Replace that preliminary record with measured data.
+        lines = [
+            line for line in lines
+            if not (
+                (previous := json.loads(line)).get("claim_id") == claim["id"]
+                and previous.get("claim_started_at") == claim["started_at"]
+            )
+        ]
     lines.append(json.dumps(entry) + "\n")
     temporary_path = f"{HISTORY_PATH}.tmp-{os.getpid()}"
     with open(temporary_path, "w") as temporary_file:
@@ -782,7 +794,12 @@ def main():
         print("machine-resources: --memory must be positive and --cpus not negative", file=sys.stderr)
         return EXIT_USAGE_ERROR
     try:
-        return arguments.handler(arguments)
+        exit_code = arguments.handler(arguments)
+        # Windows child statuses are unsigned DWORDs, but older Python versions
+        # pass sys.exit() through a signed C long. Preserve the same 32 bits.
+        if IS_WINDOWS and 0x80000000 <= exit_code <= 0xFFFFFFFF:
+            return exit_code - 0x100000000
+        return exit_code
     except UsageError as error:
         print(f"machine-resources: {error}", file=sys.stderr)
         return EXIT_USAGE_ERROR

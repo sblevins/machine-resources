@@ -100,6 +100,56 @@ class CliTests(IsolatedRegistryTest):
         self.assertEqual(self.registry()["claims"], [])
         self.assertEqual(self.history()[0]["exit_code"], 128 + signal.SIGTERM)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows DWORD exit codes")
+    def test_windows_crash_status_is_forwarded_without_truncation(self):
+        result = self.cli(
+            "run", "-m", "64M", "-c", "0", "-d", "Windows exit status", "--",
+            sys.executable, "-c",
+            "import ctypes; ctypes.windll.kernel32.ExitProcess(0xC0000005)",
+        )
+        self.assertEqual(result.returncode, 0xC0000005, result.stderr)
+        self.assertEqual(self.history()[0]["exit_code"], 0xC0000005)
+        self.assertEqual(self.registry()["claims"], [])
+
+    def test_concurrent_stale_sweep_is_reconciled_with_finished_history(self):
+        # Force a real second CLI to sweep after child exit but before the
+        # wrapper records completion, instead of relying on scheduler timing.
+        wrapper_source = """
+import importlib.util
+import subprocess
+import sys
+
+specification = importlib.util.spec_from_file_location("race_tool", sys.argv[1])
+tool = importlib.util.module_from_spec(specification)
+specification.loader.exec_module(tool)
+original_supervise = tool.supervise_child
+
+def sweep_before_finalization(child, claim):
+    child.wait()
+    subprocess.run([sys.executable, sys.argv[2], "status", "--json"],
+                   check=True, capture_output=True, timeout=10)
+    return original_supervise(child, claim)
+
+tool.supervise_child = sweep_before_finalization
+arguments = tool.build_parser().parse_args([
+    "run", "-m", "64M", "-c", "0", "-d", "completion race", "--",
+    sys.executable, "-c", "pass",
+])
+raise SystemExit(tool.command_run(arguments))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", wrapper_source, str(SOURCE), str(SCRIPT)],
+            env=self.environment, cwd=self.registry_directory,
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = self.history()
+        self.assertEqual(len(entries), 1, entries)
+        self.assertEqual(entries[0]["outcome"], "finished")
+        self.assertEqual(entries[0]["exit_code"], 0)
+        self.assertIsNotNone(entries[0]["peak_memory_bytes"])
+        self.assertEqual(self.registry()["claims"], [])
+
     def test_claim_duplicate_and_explicit_release_by_id_or_pid(self):
         for release_by_pid in (False, True):
             with self.subTest(release_by_pid=release_by_pid):
@@ -174,6 +224,19 @@ class CliTests(IsolatedRegistryTest):
 
 
 class PlatformFactsTests(IsolatedRegistryTest):
+    def test_windows_main_converts_dword_to_signed_exit_value(self):
+        arguments = mock.Mock()
+        arguments.memory = 1
+        arguments.cpus = 0
+        for child_status, wrapper_status in ((7, 7), (0xC0000005, -1073741819),
+                                              (0xFFFFFFFF, -1)):
+            with self.subTest(child_status=child_status), \
+                 mock.patch.object(self.tool, "IS_WINDOWS", True), \
+                 mock.patch.object(self.tool, "build_parser") as parser:
+                parser.return_value.parse_args.return_value = arguments
+                arguments.handler.return_value = child_status
+                self.assertEqual(self.tool.main(), wrapper_status)
+
     def test_live_process_facts_are_available_and_stable(self):
         process_id = os.getpid()
         identity = self.tool.process_start_ticks(process_id)
