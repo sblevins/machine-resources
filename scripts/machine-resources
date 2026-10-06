@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""Shared registry where agents reserve memory and CPUs before starting heavy work.
+
+Every agent on this machine checks the same registry before it launches a test
+suite, build, fuzzer, or server, reducing the risk of parallel agents starting
+more work than the machine can hold. The recommended policy lives in SKILL.md.
+
+Free memory is computed as the kernel's MemAvailable minus the part of each live
+reservation that its process has not grown into yet, minus a safety headroom.
+Memory a reserved process already uses is already missing from MemAvailable, so
+only the unused remainder of each reservation is subtracted again.
+
+A reservation is tied to a process id, its kernel start time, and the boot id,
+so a reservation whose process has died (or whose pid was reused by something
+else, or which predates a reboot) is detected and removed automatically by any
+later call. Nobody has to clean up after an interrupted agent by hand.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+
+REGISTRY_DIRECTORY = os.environ.get("MACHINE_RESOURCES_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "machine-resources",
+)
+REGISTRY_PATH = os.path.join(REGISTRY_DIRECTORY, "registry.json")
+LOCK_PATH = os.path.join(REGISTRY_DIRECTORY, "registry.lock")
+HISTORY_PATH = os.path.join(REGISTRY_DIRECTORY, "history.jsonl")
+
+HISTORY_MAX_ENTRIES = 1000
+EXIT_USAGE_ERROR = 2
+# sysexits EX_TEMPFAIL: not enough free resources right now, retrying later can work
+EXIT_NOT_ENOUGH_RESOURCES = 75
+WAIT_POLL_SECONDS = 5
+PEAK_SAMPLE_SECONDS = 2
+EXIT_POLL_SECONDS = 0.1
+LONG_RUNNING_WITHOUT_ESTIMATE_SECONDS = 24 * 3600
+COMMAND_TEXT_MAX_LENGTH = 300
+AGENT_ENVIRONMENT_VARIABLES = ("AI_AGENT", "CLAUDE_CODE_SESSION_ID", "HERDR_PANE_ID")
+
+PAGE_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
+SIZE_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+class UsageError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- parsing / formatting
+
+
+def parse_size(text):
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*", text, re.IGNORECASE)
+    if not match:
+        raise argparse.ArgumentTypeError(f"not a size like 512M or 8G: {text!r}")
+    return int(float(match.group(1)) * SIZE_UNITS[match.group(2).upper()])
+
+
+def parse_duration(text):
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", text)
+    if not match:
+        raise argparse.ArgumentTypeError(f"not a duration like 90s, 30m, 2h or 1d: {text!r}")
+    return int(float(match.group(1)) * DURATION_UNITS[match.group(2) or "s"])
+
+
+def format_size(size_bytes):
+    for unit in ("T", "G", "M", "K"):
+        if abs(size_bytes) >= SIZE_UNITS[unit]:
+            return f"{size_bytes / SIZE_UNITS[unit]:.1f}{unit}"
+    return f"{size_bytes}B"
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}d{seconds % 86400 // 3600:02d}h"
+
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def age_seconds(started_at_iso):
+    return max(0, (datetime.now().astimezone() - datetime.fromisoformat(started_at_iso)).total_seconds())
+
+
+# ---------------------------------------------------------------- machine and process facts
+
+
+def read_meminfo_bytes():
+    meminfo = {}
+    with open("/proc/meminfo") as meminfo_file:
+        for line in meminfo_file:
+            name, value = line.split(":", 1)
+            meminfo[name] = int(value.split()[0]) * 1024
+    return meminfo
+
+
+def current_boot_id():
+    with open("/proc/sys/kernel/random/boot_id") as boot_id_file:
+        return boot_id_file.read().strip()
+
+
+def usable_cpu_count():
+    return len(os.sched_getaffinity(0))
+
+
+def read_process_stat_fields(pid):
+    """Fields of /proc/<pid>/stat after the command name, or None if the process is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat_file:
+            stat_text = stat_file.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    # the command name may itself contain spaces and parentheses, so split after the last ')'
+    return stat_text[stat_text.rindex(")") + 2 :].split()
+
+
+def process_start_ticks(pid):
+    stat_fields = read_process_stat_fields(pid)
+    # overall field 22 (starttime); stat_fields starts at overall field 3
+    return int(stat_fields[19]) if stat_fields else None
+
+
+def process_command_text(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as cmdline_file:
+            arguments = cmdline_file.read().rstrip(b"\0").split(b"\0")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return ""
+    return " ".join(argument.decode(errors="replace") for argument in arguments)[:COMMAND_TEXT_MAX_LENGTH]
+
+
+def process_name(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as comm_file:
+            return comm_file.read().strip()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return ""
+
+
+def snapshot_process_table():
+    """Map of pid -> (parent pid, resident memory bytes) for every visible process."""
+    process_table = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        stat_fields = read_process_stat_fields(entry)
+        if stat_fields:
+            # overall fields 4 (ppid) and 24 (rss in pages)
+            process_table[int(entry)] = (int(stat_fields[1]), int(stat_fields[21]) * PAGE_SIZE_BYTES)
+    return process_table
+
+
+def process_tree_memory_bytes(root_pid, process_table):
+    """Resident memory of a process plus all of its descendants."""
+    children_by_parent = {}
+    for pid, (parent_pid, _) in process_table.items():
+        children_by_parent.setdefault(parent_pid, []).append(pid)
+    total_bytes = 0
+    pending_pids = [root_pid]
+    while pending_pids:
+        pid = pending_pids.pop()
+        if pid in process_table:
+            total_bytes += process_table[pid][1]
+            pending_pids.extend(children_by_parent.get(pid, []))
+    return total_bytes
+
+
+def claim_process_is_alive(claim, boot_id):
+    return claim.get("boot_id") == boot_id and process_start_ticks(claim["pid"]) == claim.get("process_start_ticks")
+
+
+def stale_reason(claim, boot_id):
+    if claim.get("boot_id") != boot_id:
+        return "machine rebooted since it was registered"
+    if process_start_ticks(claim["pid"]) is None:
+        return f"pid {claim['pid']} is no longer running"
+    return f"pid {claim['pid']} now belongs to a different process"
+
+
+def calling_agent_identity():
+    return {name: os.environ[name] for name in AGENT_ENVIRONMENT_VARIABLES if os.environ.get(name)}
+
+
+# ---------------------------------------------------------------- registry storage
+
+
+@contextmanager
+def locked_registry(claim_id_being_released=None):
+    """Hold the registry lock, yield the registry with stale claims already removed, save on exit.
+
+    The claim being released by its own `run` wrapper is exempt from the stale sweep:
+    its child was already reaped, and it is recorded as finished, not stale.
+    """
+    os.makedirs(REGISTRY_DIRECTORY, mode=0o700, exist_ok=True)
+    with open(LOCK_PATH, "a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            registry = load_registry()
+            remove_stale_claims(registry, claim_id_being_released)
+            yield registry
+            save_registry(registry)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def load_registry():
+    try:
+        with open(REGISTRY_PATH) as registry_file:
+            registry = json.load(registry_file)
+        if not isinstance(registry.get("claims"), list):
+            raise ValueError("missing claims list")
+    except FileNotFoundError:
+        registry = {"version": 1, "claims": []}
+    except ValueError as error:
+        corrupt_copy_path = f"{REGISTRY_PATH}.corrupt-{int(time.time())}"
+        os.replace(REGISTRY_PATH, corrupt_copy_path)
+        print(f"machine-resources: registry was unreadable ({error}); moved to {corrupt_copy_path}", file=sys.stderr)
+        registry = {"version": 1, "claims": []}
+    registry["removed_stale_claims"] = []
+    return registry
+
+
+def save_registry(registry):
+    persisted = {"version": 1, "claims": registry["claims"]}
+    temporary_path = f"{REGISTRY_PATH}.tmp-{os.getpid()}"
+    with open(temporary_path, "w") as temporary_file:
+        json.dump(persisted, temporary_file, indent=2)
+        temporary_file.write("\n")
+    os.replace(temporary_path, REGISTRY_PATH)
+
+
+def remove_stale_claims(registry, exempt_claim_id=None):
+    boot_id = current_boot_id()
+    live_claims = []
+    for claim in registry["claims"]:
+        if claim["id"] == exempt_claim_id or claim_process_is_alive(claim, boot_id):
+            live_claims.append(claim)
+            continue
+        reason = stale_reason(claim, boot_id)
+        registry["removed_stale_claims"].append({**claim, "stale_reason": reason})
+        append_history(claim, outcome="stale", note=reason)
+    registry["claims"] = live_claims
+
+
+def append_history(claim, outcome, note=None, exit_code=None, peak_memory_bytes=None):
+    """Record a finished reservation so later agents can calibrate their estimates. Caller holds the lock."""
+    entry = {
+        "finished_at": now_iso(),
+        "outcome": outcome,
+        "description": claim["description"],
+        "command": claim["command"],
+        "working_directory": claim.get("working_directory"),
+        "reserved_memory_bytes": claim["memory_bytes"],
+        "peak_memory_bytes": peak_memory_bytes,
+        "cpus": claim["cpus"],
+        "duration_seconds": int(age_seconds(claim["started_at"])),
+        "exit_code": exit_code,
+    }
+    if note:
+        entry["note"] = note
+    lines = []
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH) as history_file:
+            lines = history_file.readlines()
+    lines.append(json.dumps(entry) + "\n")
+    temporary_path = f"{HISTORY_PATH}.tmp-{os.getpid()}"
+    with open(temporary_path, "w") as temporary_file:
+        temporary_file.writelines(lines[-HISTORY_MAX_ENTRIES:])
+    os.replace(temporary_path, HISTORY_PATH)
+
+
+def report_removed_stale_claims(registry):
+    for claim in registry["removed_stale_claims"]:
+        print(
+            f"machine-resources: removed stale claim {claim['id']} "
+            f"({claim['description']!r}, registered {format_duration(age_seconds(claim['started_at']))} ago): "
+            f"{claim['stale_reason']}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------- capacity
+
+
+def headroom_bytes(total_memory_bytes):
+    configured = os.environ.get("MACHINE_RESOURCES_HEADROOM")
+    if configured:
+        return parse_size(configured)
+    return max(4 * SIZE_UNITS["G"], total_memory_bytes // 10)
+
+
+def compute_capacity(claims):
+    meminfo = read_meminfo_bytes()
+    process_table = snapshot_process_table()
+    total_memory_bytes = meminfo["MemTotal"]
+    available_memory_bytes = meminfo["MemAvailable"]
+    total_cpus = usable_cpu_count()
+
+    claim_usage = []
+    unused_reserved_memory_bytes = 0
+    for claim in claims:
+        used_memory_bytes = process_tree_memory_bytes(claim["pid"], process_table)
+        unused_reserved_memory_bytes += max(0, claim["memory_bytes"] - used_memory_bytes)
+        claim_usage.append({**claim, "used_memory_bytes": used_memory_bytes})
+
+    kept_free_bytes = headroom_bytes(total_memory_bytes)
+    reserved_cpus = sum(claim["cpus"] for claim in claims)
+    return {
+        "total_memory_bytes": total_memory_bytes,
+        "available_memory_bytes": available_memory_bytes,
+        "reserved_memory_bytes": sum(claim["memory_bytes"] for claim in claims),
+        "reserved_but_unused_memory_bytes": unused_reserved_memory_bytes,
+        "headroom_bytes": kept_free_bytes,
+        "free_memory_bytes": max(0, available_memory_bytes - unused_reserved_memory_bytes - kept_free_bytes),
+        "reservable_memory_ceiling_bytes": total_memory_bytes - kept_free_bytes,
+        "total_cpus": total_cpus,
+        "reserved_cpus": reserved_cpus,
+        "free_cpus": max(0, total_cpus - reserved_cpus),
+        "load_average_1m": os.getloadavg()[0],
+        "claims": claim_usage,
+    }
+
+
+def check_request_is_possible(capacity, memory_bytes, cpus):
+    if memory_bytes > capacity["reservable_memory_ceiling_bytes"]:
+        raise UsageError(
+            f"{format_size(memory_bytes)} can never fit: this machine lets at most "
+            f"{format_size(capacity['reservable_memory_ceiling_bytes'])} be reserved"
+        )
+    if cpus > capacity["total_cpus"]:
+        raise UsageError(f"{cpus} CPUs can never fit: this machine has {capacity['total_cpus']}")
+
+
+def request_fits(capacity, memory_bytes, cpus):
+    return memory_bytes <= capacity["free_memory_bytes"] and cpus <= capacity["free_cpus"]
+
+
+def claim_flags(claim):
+    elapsed_seconds = age_seconds(claim["started_at"])
+    expected_seconds = claim.get("expected_duration_seconds")
+    flags = []
+    if expected_seconds and elapsed_seconds > expected_seconds:
+        flags.append(f"OVERDUE (expected {format_duration(expected_seconds)})")
+    elif not expected_seconds and elapsed_seconds > LONG_RUNNING_WITHOUT_ESTIMATE_SECONDS:
+        flags.append("LONG-RUNNING (no expected duration given)")
+    if claim["used_memory_bytes"] > claim["memory_bytes"]:
+        flags.append("OVER RESERVATION")
+    return flags
+
+
+def print_capacity_report(capacity, output_file=sys.stdout):
+    def emit(line=""):
+        print(line, file=output_file)
+
+    emit(
+        f"Machine: {capacity['total_cpus']} CPUs (load {capacity['load_average_1m']:.1f}), "
+        f"{format_size(capacity['total_memory_bytes'])} memory, "
+        f"{format_size(capacity['available_memory_bytes'])} available right now"
+    )
+    emit(
+        f"Reserved: {len(capacity['claims'])} claims, {format_size(capacity['reserved_memory_bytes'])} memory "
+        f"({format_size(capacity['reserved_but_unused_memory_bytes'])} not in use yet), "
+        f"{capacity['reserved_cpus']} CPUs"
+    )
+    emit(f"Headroom always kept free: {format_size(capacity['headroom_bytes'])}")
+    emit(
+        f"FREE TO RESERVE: {format_size(capacity['free_memory_bytes'])} memory, "
+        f"{capacity['free_cpus']} CPUs"
+    )
+    if not capacity["claims"]:
+        return
+    emit()
+    emit(f"{'ID':<8} {'PID':>8} {'AGE':>7} {'MEM USED/RESERVED':>17} {'CPUS':>4}  DESCRIPTION")
+    for claim in sorted(capacity["claims"], key=lambda claim: claim["started_at"]):
+        memory_column = f"{format_size(claim['used_memory_bytes'])}/{format_size(claim['memory_bytes'])}"
+        emit(
+            f"{claim['id']:<8} {claim['pid']:>8} {format_duration(age_seconds(claim['started_at'])):>7} "
+            f"{memory_column:>17} {claim['cpus']:>4}  {claim['description']}"
+        )
+        agent = claim.get("agent") or {}
+        details = [claim.get("working_directory") or "?"]
+        details += [f"{name}={value}" for name, value in agent.items()]
+        emit(f"{'':<8} {'':>8} {'':>7} {'':>17} {'':>4}  {' '.join(details)}")
+        for flag in claim_flags(claim):
+            emit(f"{'':<8} {'':>8} {'':>7} {'':>17} {'':>4}  ! {flag}")
+
+
+def print_refusal(capacity, memory_bytes, cpus):
+    print(
+        f"machine-resources: not enough free resources for {format_size(memory_bytes)} memory "
+        f"and {cpus} CPUs right now.",
+        file=sys.stderr,
+    )
+    print_capacity_report(capacity, output_file=sys.stderr)
+    print(
+        "\nOptions: retry with --wait, request less (fewer parallel jobs or workers), "
+        "or tell the user what is holding the resources. Do not start the work anyway.",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------- claims
+
+
+def new_claim(pid, arguments, command_text):
+    return {
+        "id": secrets.token_hex(3),
+        "pid": pid,
+        "process_start_ticks": process_start_ticks(pid),
+        "boot_id": current_boot_id(),
+        "process_name": process_name(pid),
+        "command": command_text[:COMMAND_TEXT_MAX_LENGTH],
+        "description": arguments.description,
+        "memory_bytes": arguments.memory,
+        "cpus": arguments.cpus,
+        "hard_memory_limit": bool(getattr(arguments, "hard_limit", False)),
+        "started_at": now_iso(),
+        "expected_duration_seconds": arguments.expected_duration,
+        "working_directory": os.getcwd(),
+        "agent": calling_agent_identity(),
+    }
+
+
+def remove_claim(registry, claim_id):
+    for claim in registry["claims"]:
+        if claim["id"] == claim_id:
+            registry["claims"].remove(claim)
+            return claim
+    return None
+
+
+def command_status(arguments):
+    with locked_registry() as registry:
+        capacity = compute_capacity(registry["claims"])
+    if arguments.json:
+        for claim in capacity["claims"]:
+            claim["flags"] = claim_flags(claim)
+            claim["age_seconds"] = int(age_seconds(claim["started_at"]))
+        capacity["removed_stale_claims"] = registry["removed_stale_claims"]
+        json.dump(capacity, sys.stdout, indent=2)
+        print()
+    else:
+        report_removed_stale_claims(registry)
+        print_capacity_report(capacity)
+    return 0
+
+
+def command_run(arguments):
+    command = arguments.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise UsageError("give the command to run after --")
+    launched_command = command
+    if arguments.hard_limit:
+        launched_command = [
+            "systemd-run", "--user", "--scope", "--quiet", "--collect",
+            "-p", f"MemoryMax={arguments.memory}", "-p", "MemorySwapMax=0", "--",
+        ] + command
+
+    wait_deadline = time.monotonic() + (arguments.wait or 0)
+    announced_waiting = False
+    while True:
+        with locked_registry() as registry:
+            report_removed_stale_claims(registry)
+            capacity = compute_capacity(registry["claims"])
+            check_request_is_possible(capacity, arguments.memory, arguments.cpus)
+            if request_fits(capacity, arguments.memory, arguments.cpus):
+                # spawned while the lock is held, so no other agent can take the same free space
+                try:
+                    child = subprocess.Popen(launched_command)
+                except OSError as error:
+                    raise UsageError(f"cannot start {launched_command[0]!r}: {error.strerror}")
+                claim = new_claim(child.pid, arguments, " ".join(command))
+                registry["claims"].append(claim)
+                break
+        if time.monotonic() >= wait_deadline:
+            print_refusal(capacity, arguments.memory, arguments.cpus)
+            return EXIT_NOT_ENOUGH_RESOURCES
+        if not announced_waiting:
+            print(
+                f"machine-resources: waiting for {format_size(arguments.memory)} memory and "
+                f"{arguments.cpus} CPUs (free now: {format_size(capacity['free_memory_bytes'])}, "
+                f"{capacity['free_cpus']} CPUs)...",
+                file=sys.stderr,
+            )
+            announced_waiting = True
+        time.sleep(WAIT_POLL_SECONDS)
+
+    print(
+        f"machine-resources: claim {claim['id']} holds {format_size(arguments.memory)} memory and "
+        f"{arguments.cpus} CPUs for pid {child.pid}",
+        file=sys.stderr,
+    )
+    return supervise_child(child.pid, claim)
+
+
+def supervise_child(child_pid, claim):
+    """Wait for the child, track its peak memory, then release the claim and record history."""
+
+    def forward_signal(signal_number, _frame):
+        try:
+            os.kill(child_pid, signal_number)
+        except ProcessLookupError:
+            pass
+
+    # Ctrl-C already reaches the child through the shared process group; the wrapper
+    # only needs to survive it long enough to release the claim afterwards.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, forward_signal)
+    signal.signal(signal.SIGHUP, forward_signal)
+
+    peak_memory_bytes = 0
+    next_sample_time = 0.0
+    while True:
+        finished_pid, wait_status, resource_usage = os.wait4(child_pid, os.WNOHANG)
+        if finished_pid:
+            break
+        if time.monotonic() >= next_sample_time:
+            peak_memory_bytes = max(peak_memory_bytes, process_tree_memory_bytes(child_pid, snapshot_process_table()))
+            next_sample_time = time.monotonic() + PEAK_SAMPLE_SECONDS
+        time.sleep(EXIT_POLL_SECONDS)
+    peak_memory_bytes = max(peak_memory_bytes, resource_usage.ru_maxrss * 1024)
+    exit_code = os.waitstatus_to_exitcode(wait_status)
+    shell_exit_code = exit_code if exit_code >= 0 else 128 - exit_code
+
+    with locked_registry(claim_id_being_released=claim["id"]) as registry:
+        remove_claim(registry, claim["id"])
+        append_history(claim, outcome="finished", exit_code=shell_exit_code, peak_memory_bytes=peak_memory_bytes)
+
+    note = f"peak memory {format_size(peak_memory_bytes)} of {format_size(claim['memory_bytes'])} reserved"
+    if claim["hard_memory_limit"] and exit_code == -signal.SIGKILL and peak_memory_bytes >= claim["memory_bytes"] * 0.9:
+        note += "; killed at the hard memory limit, so the reservation was too small"
+    print(f"machine-resources: released claim {claim['id']} ({note})", file=sys.stderr)
+    return shell_exit_code
+
+
+def command_claim(arguments):
+    with locked_registry() as registry:
+        report_removed_stale_claims(registry)
+        if process_start_ticks(arguments.pid) is None:
+            raise UsageError(f"pid {arguments.pid} is not running")
+        if any(claim["pid"] == arguments.pid for claim in registry["claims"]):
+            raise UsageError(f"pid {arguments.pid} already has a claim")
+        capacity = compute_capacity(registry["claims"])
+        check_request_is_possible(capacity, arguments.memory, arguments.cpus)
+        # the process already exists, so whatever it uses now is already out of MemAvailable
+        already_used_bytes = process_tree_memory_bytes(arguments.pid, snapshot_process_table())
+        still_needed_bytes = max(0, arguments.memory - already_used_bytes)
+        if not request_fits(capacity, still_needed_bytes, arguments.cpus):
+            print_refusal(capacity, still_needed_bytes, arguments.cpus)
+            return EXIT_NOT_ENOUGH_RESOURCES
+        claim = new_claim(arguments.pid, arguments, process_command_text(arguments.pid))
+        registry["claims"].append(claim)
+    print(claim["id"])
+    print(
+        f"machine-resources: claim {claim['id']} holds {format_size(arguments.memory)} memory and "
+        f"{arguments.cpus} CPUs for pid {arguments.pid} until it exits or is released",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def command_release(arguments):
+    with locked_registry() as registry:
+        report_removed_stale_claims(registry)
+        matching_claims = [
+            claim for claim in registry["claims"]
+            if claim["id"] == arguments.target or str(claim["pid"]) == arguments.target
+        ]
+        if not matching_claims:
+            print(f"machine-resources: no live claim with id or pid {arguments.target}", file=sys.stderr)
+            return 1
+        for claim in matching_claims:
+            remove_claim(registry, claim["id"])
+            append_history(claim, outcome="released")
+            print(f"machine-resources: released claim {claim['id']} ({claim['description']!r})", file=sys.stderr)
+    return 0
+
+
+def command_history(arguments):
+    if not os.path.exists(HISTORY_PATH):
+        return 0
+    with open(HISTORY_PATH) as history_file:
+        entries = [json.loads(line) for line in history_file if line.strip()]
+    if arguments.match:
+        needle = arguments.match.lower()
+        entries = [
+            entry for entry in entries
+            if needle in f"{entry['description']} {entry['command']} {entry.get('working_directory')}".lower()
+        ]
+    entries = entries[-arguments.limit :]
+    if arguments.json:
+        json.dump(entries, sys.stdout, indent=2)
+        print()
+        return 0
+    print(f"{'FINISHED':<19} {'OUTCOME':<8} {'PEAK/RESERVED':>13} {'CPUS':>4} {'TOOK':>7} {'EXIT':>4}  DESCRIPTION / COMMAND")
+    for entry in entries:
+        peak_text = format_size(entry["peak_memory_bytes"]) if entry.get("peak_memory_bytes") is not None else "?"
+        exit_text = str(entry["exit_code"]) if entry.get("exit_code") is not None else "-"
+        print(
+            f"{entry['finished_at'][:19]:<19} {entry['outcome']:<8} "
+            f"{peak_text + '/' + format_size(entry['reserved_memory_bytes']):>13} {entry['cpus']:>4} "
+            f"{format_duration(entry['duration_seconds']):>7} {exit_text:>4}  {entry['description']}"
+        )
+        print(f"{'':<19} {'':<8} {'':>13} {'':>4} {'':>7} {'':>4}  $ {entry['command']}")
+    return 0
+
+
+# ---------------------------------------------------------------- command line
+
+
+def add_request_arguments(parser):
+    parser.add_argument("-m", "--memory", type=parse_size, required=True,
+                        help="peak memory the work is expected to need, e.g. 512M or 8G")
+    parser.add_argument("-c", "--cpus", type=int, default=1, help="CPU cores it will keep busy (default 1)")
+    parser.add_argument("-d", "--description", required=True, help="short description of the task, shown to other agents")
+    parser.add_argument("-e", "--expected-duration", type=parse_duration,
+                        help="how long it should take, e.g. 10m; flags the claim as overdue after that")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="machine-resources",
+        description="Reserve memory and CPUs in the machine-wide agent registry before starting heavy work.",
+    )
+    subcommands = parser.add_subparsers(dest="subcommand", required=True)
+
+    status_parser = subcommands.add_parser("status", help="show free resources and who holds what (removes stale claims)")
+    status_parser.add_argument("--json", action="store_true")
+    status_parser.set_defaults(handler=command_status)
+
+    run_parser = subcommands.add_parser(
+        "run", help="reserve resources, run a command, release when it exits",
+        usage="machine-resources run -m SIZE [-c N] -d TEXT [-e DURATION] [--wait SECONDS] [--hard-limit] -- COMMAND...",
+    )
+    add_request_arguments(run_parser)
+    run_parser.add_argument("-w", "--wait", type=parse_duration, nargs="?", const=parse_duration("30m"), default=0,
+                            help="queue until resources free up instead of refusing (default 30m if no value given)")
+    run_parser.add_argument("--hard-limit", action="store_true",
+                            help="also cap the command at --memory with a cgroup; it is killed if it exceeds it")
+    run_parser.add_argument("command", nargs=argparse.REMAINDER)
+    run_parser.set_defaults(handler=command_run)
+
+    claim_parser = subcommands.add_parser("claim", help="register an already running process (released when it exits)")
+    claim_parser.add_argument("-p", "--pid", type=int, required=True)
+    add_request_arguments(claim_parser)
+    claim_parser.set_defaults(handler=command_claim)
+
+    release_parser = subcommands.add_parser("release", help="release a claim early by claim id or pid")
+    release_parser.add_argument("target", help="claim id or pid")
+    release_parser.set_defaults(handler=command_release)
+
+    history_parser = subcommands.add_parser("history", help="actual peak memory of past runs, for sizing estimates")
+    history_parser.add_argument("-n", "--limit", type=int, default=20)
+    history_parser.add_argument("-s", "--match", help="only entries whose description, command or directory contains this")
+    history_parser.add_argument("--json", action="store_true")
+    history_parser.set_defaults(handler=command_history)
+    return parser
+
+
+def main():
+    arguments = build_parser().parse_args()
+    if getattr(arguments, "memory", 1) <= 0 or getattr(arguments, "cpus", 1) < 0:
+        print("machine-resources: --memory must be positive and --cpus not negative", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+    try:
+        return arguments.handler(arguments)
+    except UsageError as error:
+        print(f"machine-resources: {error}", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+    except KeyboardInterrupt:
+        return 128 + signal.SIGINT
+
+
+if __name__ == "__main__":
+    sys.exit(main())
